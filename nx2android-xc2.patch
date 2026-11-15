@@ -1,0 +1,490 @@
+diff --git a/nxnative/dm/android/front_android.c b/nxnative/dm/android/front_android.c
+index 3795341..a0b1e4b 100644
+--- a/nxnative/dm/android/front_android.c
++++ b/nxnative/dm/android/front_android.c
+@@ -49,6 +49,15 @@ void front_screen_match(int fps) { (void)fps; }
+ static ANativeActivity *g_act;
+ static jmethodID g_audio_menu_method;
+ int dm_menu_audio_available(void) { return g_audio_menu_method != NULL; }
++// The pause menu's Frame rate row: for a game whose rewriter stubs step by the host's target (the frame step state page, loader.c), 30 or 60 fps
++int dm_fps_target_get(void); void dm_fps_target_set(int t); int dm_fps_target_has(void);
++int dm_menu_rate_available(void) { return dm_fps_target_has(); }
++// The Resolution row: for a game with a render-scale stub (loader.c dm_render_scale_has). Its steps are render scales the host hands the stub (DM_RENDER_SCALE, read
++// again every 30 presents: hle_nvn.c), 1.0 = the game's own size and dynamic resolution
++int dm_render_scale_has(void);
++int dm_menu_res_available(void) { return dm_render_scale_has(); }
++static const char *const RES_SCALES[3] = {"0.5", "1.0", "0.9"};   // low, auto (the game's own), high: what a stub makes of them is its game's (Xenoblade Chronicles 2's patches.py)
++static void res_apply(int step) { setenv("DM_RENDER_SCALE", RES_SCALES[step < 0 ? 0 : step > 2 ? 2 : step], 1); }
+ AAssetManager *dm_front_assets(void) { return g_act ? g_act->assetManager : NULL; }   // the APK's assets (overlay_theme.c: the gamepad's theme)
+ static pthread_mutex_t g_win_mu = PTHREAD_MUTEX_INITIALIZER;
+ static ANativeWindow *g_win, *g_external_win;
+@@ -77,6 +86,8 @@ static char g_root[512];
+ static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the gamepad shown; rumble and tap vibration; the frame rate counter (top left)
+ static _Atomic int g_set_opacity = 60;   // the gamepad's opacity, percent (OV_OPACITY_MIN..MAX: the menu's Opacity slider)
+ static _Atomic int g_set_grid;   // the layout editor's Snap to grid
++static _Atomic int g_set_res = 1;       // the Resolution row's step: 0 low, 1 auto = the game's own, 2 high (settings.txt res=; the render scale RES_SCALES gives the host)
++static _Atomic int g_set_rate = -1;     // the frame step's target the player chose in the pause menu (30 or 60; settings.txt rate=); -1: the profile's or env.txt's
+ static _Atomic int g_set_labels = -1;   // a controller's face buttons by their label (1) or their position (0); -1: as env.txt says (pad_labels)
+ // the player's own layout (overlay_layout.h dm_overlay_custom): [0] the saved one (settings.txt ui= rows), [1] the layout editor's while it is open; per layout
+ // and control: x + 1, y + 1 in 1/10000 of the window's width and height (0 = the layout's place), the size factor in 1/1000 (0 = 1), 1 when hidden
+@@ -93,6 +104,8 @@ static void settings_load(void) {
+         else if (sscanf(line, "docked=%d", &v) == 1) setenv("DM_OPMODE", v ? "1" : "0", 1);   // over env.txt's: the host reads it once, at its first query
+         else if (sscanf(line, "opacity=%d", &v) == 1) atomic_store(&g_set_opacity, v < OV_OPACITY_MIN ? OV_OPACITY_MIN : v > OV_OPACITY_MAX ? OV_OPACITY_MAX : v);
+         else if (sscanf(line, "grid=%d", &v) == 1) atomic_store(&g_set_grid, v != 0);
++        else if (sscanf(line, "res=%d", &v) == 1 && v >= 0 && v <= 2) { atomic_store(&g_set_res, v); res_apply(v); }   // over env.txt's: the loader reads it when the game starts
++        else if (sscanf(line, "rate=%d", &v) == 1 && (v == 30 || v == 60)) { atomic_store(&g_set_rate, v); setenv("DM_FPS_TARGET", v == 60 ? "60" : "30", 1); }   // over env.txt's: the loader reads it when the game starts
+         else if (sscanf(line, "labels=%d", &v) == 1) atomic_store(&g_set_labels, v != 0);
+         else if (!strncmp(line, "ui=", 3)) {   // ui=<layout>,<control>,<x>,<y>,<size>[,<hidden>]: x, y in 1/10000 of the window (-1 the layout's place), size in 1/1000
+             char lay[16], name[32]; int x, y, z, hid = 0, l, i;
+@@ -112,6 +125,8 @@ static void settings_save(void) {
+     FILE *f = fopen(tmp, "w"); if (!f) { LOG("[RED] cannot write %s", tmp); return; }
+     fprintf(f, "overlay=%d\nrumble=%d\ndocked=%d\nfps=%d\nopacity=%d\ngrid=%d\n", atomic_load(&g_set_overlay), atomic_load(&g_set_rumble), dm_opmode() != 0, atomic_load(&g_set_fps),
+             atomic_load(&g_set_opacity), atomic_load(&g_set_grid));
++    if (atomic_load(&g_set_rate) > 0) fprintf(f, "rate=%d\n", atomic_load(&g_set_rate));
++    if (atomic_load(&g_set_res) != 1) fprintf(f, "res=%d\n", atomic_load(&g_set_res));   // (only once the player chose)
+     if (atomic_load(&g_set_labels) >= 0) fprintf(f, "labels=%d\n", atomic_load(&g_set_labels));   // (only once the player chose: until then env.txt decides)
+     for (int l = 0; l < 2; l++) for (int i = 0; i < OV_N; i++) {
+         _Atomic int *c = g_cust[0][l][i]; int x = atomic_load(&c[0]), y = atomic_load(&c[1]), z = atomic_load(&c[2]), hid = atomic_load(&c[3]);
+@@ -470,7 +485,7 @@ int dm_menu_state(void) {
+     if (atomic_load(&g_edit)) return OVE_ST | atomic_load(&g_ed_st);
+     if (atomic_load(&g_sp_on)) return OVS_ST | (atomic_load(&g_sp_hi) + 1) << 4 | (atomic_load(&g_sp_ver) & 255) << 20;
+     return atomic_load(&g_set_overlay) | atomic_load(&g_set_rumble) << 1 | (dm_opmode() != 0) << 2 | atomic_load(&g_set_fps) << 3 | (atomic_load(&g_menu_hi) + 1) << 4 |
+-           atomic_load(&g_menu_tab) << 8 | atomic_load(&g_set_opacity) << 9 | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_sv_n) & 15) << 24 | pad_labels() << 28;
++           atomic_load(&g_menu_tab) << 8 | atomic_load(&g_set_opacity) << 9 | atomic_load(&g_sv_st) << 20 | (atomic_load(&g_sv_n) & 15) << 24 | pad_labels() << 28 | (dm_fps_target_get() >= 60) << 29 | (atomic_load(&g_set_res) & 1) << 19 | (atomic_load(&g_set_res) >> 1 & 1) << 30;
+ }
+ int dm_overlay_fps(void) { return atomic_load(&g_set_fps) && !atomic_load(&g_menu); }   // gfx_vk_present.c draws the counter (not while the menu holds the game)
+ static void menu_open(int hi) {
+@@ -519,6 +534,8 @@ static void menu_do(int item) {
+     else if (item == OVM_FPS) { atomic_store(&g_set_fps, !atomic_load(&g_set_fps)); settings_save(); }
+     else if (item == OVM_MODE) { dm_set_opmode(dm_opmode() ? 0 : 1); settings_save(); }   // the game takes it when it goes on
+     else if (item == OVM_PAD) { atomic_store(&g_set_labels, !pad_labels()); settings_save(); }   // at once (pad_labels)
++    else if (item == OVM_RES) { int s = (atomic_load(&g_set_res) + 1) % 3; atomic_store(&g_set_res, s); res_apply(s); settings_save(); }   // each press the next step; the host takes it within 30 presents
++    else if (item == OVM_RATE) { int t = dm_fps_target_get() >= 60 ? 30 : 60; dm_fps_target_set(t); atomic_store(&g_set_rate, t); settings_save(); }   // at once: the stubs and the present pacing read the state page every frame
+     else if (item == OVM_TAB) { menu_tab(atomic_load(&g_menu_tab) + 1); return; }
+     else if (item == OVM_EDIT) { dm_haptics_android_tap(); ed_open(); return; }
+     else if (item == OVM_OPACITY) return;   // (the slider is dragged, or stepped with left and right)
+diff --git a/nxnative/dm/android/gfx_null.c b/nxnative/dm/android/gfx_null.c
+index 795093b..020e3da 100644
+--- a/nxnative/dm/android/gfx_null.c
++++ b/nxnative/dm/android/gfx_null.c
+@@ -108,6 +108,7 @@ void mtl_xv_window_tex(uint64_t serial) { (void)serial; }
+ void mtl_set_frame(uint64_t f) { (void)f; }
+ void mtl_set_depth_zero(int on) { (void)on; }
+ void mtl_set_origin_lower_left(int on) { (void)on; }
++void mtl_set_queue_origin_lower_left(int on) { (void)on; }
+ 
+ // ---------------- resources ----------------
+ void mtl_tex_init(const tex_t *t) { (void)t; }
+diff --git a/nxnative/dm/android/gfx_vk.h b/nxnative/dm/android/gfx_vk.h
+index 8609508..a30caa7 100644
+--- a/nxnative/dm/android/gfx_vk.h
++++ b/nxnative/dm/android/gfx_vk.h
+@@ -63,6 +63,7 @@ const void *vk_sg_pin(VkShaderStageFlagBits stage, const uint32_t *local);   //
+ // NULL when there is nothing the stage lacks (why empty) or it uses something not covered (why names it); the module then stays as it is
+ uint32_t *spv_one_lane(const uint32_t *w, uint32_t nw, uint32_t ops, uint32_t *onw, char *why, size_t nwhy);
+ uint32_t vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid);
++int vk_is_turnip(void);   // Mesa's Turnip is the driver (gfx_vk_core.c): the workarounds for Qualcomm's driver default to off
+ void vk_init(void);   // once, from mtl_init or the first use
+ 
+ // ---- memory pools (gfx_vk_core.c): the guest's pool memory is GPU memory (AHardwareBuffer mapped over it) ----
+diff --git a/nxnative/dm/android/gfx_vk_core.c b/nxnative/dm/android/gfx_vk_core.c
+index 003be27..e9053ea 100644
+--- a/nxnative/dm/android/gfx_vk_core.c
++++ b/nxnative/dm/android/gfx_vk_core.c
+@@ -82,6 +82,15 @@ static void mem_diag_baselines(const uint64_t count[4], const uint64_t bytes[4])
+         names[i], (unsigned long long)count[i], bytes[i] / 1048576.0, (unsigned long long)total_count[i], total_bytes[i] / 1048576.0, (unsigned long long)calls);
+ }
+ 
++// Whether the driver is Mesa's Turnip (VkPhysicalDeviceDriverProperties). The depth workarounds of gfx_vk_exec.c (lrz_touch, the fragment-depth variants) answer faults of
++// Qualcomm's driver and cost GPU time: on Turnip (Adreno 830, Mesa 26.99, Xenoblade Chronicles 2's title scene at 1280x720) the fragment-depth variants alone took the deferred
++// lighting pass from 0.20 to 1.99 ms and the frame from 10.0 to 12.0 ms of GPU, with the same picture. They default to off there (DM_VK_FDZ=1 / DM_VK_LRZ_TOUCH=1 turn them on)
++int vk_is_turnip(void) {
++    static int v = -1;
++    if (v < 0) { VkPhysicalDeviceDriverProperties dp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES}; VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dp};
++        vkGetPhysicalDeviceProperties2(V.pd, &p2); v = dp.driverID == VK_DRIVER_ID_MESA_TURNIP; VKLOG("driver: %s %s%s", dp.driverName, dp.driverInfo, v ? " (Turnip: Qualcomm depth workarounds off by default)" : ""); }
++    return v;
++}
+ uint32_t vk_mem_type(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid) {
+     for (uint32_t i = 0; i < V.mem.memoryTypeCount; i++)
+         if ((bits >> i & 1) && (V.mem.memoryTypes[i].propertyFlags & want) == want && !(V.mem.memoryTypes[i].propertyFlags & avoid)) return i;
+@@ -1158,6 +1167,10 @@ void vk_pass_report(void) {   // the most expensive passes since the last report
+     static int idx[FPASSQ]; int m = g_pmax; for (int i = 0; i < m; i++) idx[i] = i;
+     for (int i = 0; i < m; i++) for (int j = i + 1; j < m; j++) if (g_pcnt[idx[j]] && (!g_pcnt[idx[i]] || g_pacc[idx[j]] / g_pcnt[idx[j]] > g_pacc[idx[i]] / g_pcnt[idx[i]])) { int t = idx[i]; idx[i] = idx[j]; idx[j] = t; }
+     double tot = 0; for (int i = 0; i < m; i++) if (g_pcnt[i]) tot += g_pacc[i] / g_pcnt[i];
++    { double z = 0, sm = 0, few = 0; int nz = 0, nsm = 0, nfew = 0;   // where the many cheap passes add up: passes without a draw (clears), small targets, 1-3 draws
++      for (int i = 0; i < m; i++) if (g_pcnt[i] && g_plast[i].fmt != PT_DISPATCH) { double t = g_pacc[i] / g_pcnt[i]; uint32_t d = g_plast[i].draws & 0xffff;
++          if (!d) { z += t; nz++; } else if (g_plast[i].w <= 128) { sm += t; nsm++; } else if (d <= 3) { few += t; nfew++; } }
++      VKLOG("passes by kind: %d without a draw %.2f ms, %d up to 128 px wide %.2f ms, %d larger with 1-3 draws %.2f ms, the rest %.2f ms", nz, z, nsm, sm, nfew, few, tot - z - sm - few); }
+     char b[3000]; int o = snprintf(b, sizeof b, "passes by GPU time (%d passes, %.2f ms in passes per frame):", m, tot);
+     for (int i = 0; i < m && i < 20 && o < (int)sizeof b - 80; i++) { int k = idx[i]; if (!g_pcnt[k]) continue;
+         if (g_plast[k].fmt == PT_DISPATCH) o += snprintf(b + o, sizeof b - (size_t)o, " #%d %.2f ms (dispatch %ux%ux%u);", k, g_pacc[k] / g_pcnt[k], g_plast[k].w, g_plast[k].h, g_plast[k].draws);
+diff --git a/nxnative/dm/android/gfx_vk_exec.c b/nxnative/dm/android/gfx_vk_exec.c
+index 202a572..64bf33e 100644
+--- a/nxnative/dm/android/gfx_vk_exec.c
++++ b/nxnative/dm/android/gfx_vk_exec.c
+@@ -35,9 +35,12 @@ static struct {
+     VkPipeline bound_pipe; int rp_pass;   // rp_pass: the open pass began with vkCmdBeginRenderPass
+ } S;
+ static p_tf_bind g_tf[4]; static uint64_t g_tf_off[4]; static int g_tf_on, g_tf_in_pass; static uint32_t g_tf_verts;   // transform feedback: buffers, bytes written into each, capture on, a capture in the open pass (xfb_begin), vertices captured since Begin
+-static int g_depth_zero = 1, g_lower_left;
++static int g_depth_zero = 1, g_lower_left, g_queue_ll = 1;
+ void mtl_set_depth_zero(int on) { g_depth_zero = on; }
+ void mtl_set_origin_lower_left(int on) { g_lower_left = on; }
++// The submitting queue's raster origin (hle_nvn.c queue_t.origin_ll, set per submission under the submission lock): the winding follows it, the viewports and
++// scissors the device's current origin (g_lower_left). They differ when a game creates its queue before it changes the origin (Xenoblade Chronicles 2)
++void mtl_set_queue_origin_lower_left(int on) { g_queue_ll = on; }
+ // NVN's upper-left mode has clip space y up (as Metal and D3D): it is drawn with a flipped viewport over the same top-left rectangle, lower-left mode without
+ // one; the scissor is then never flipped and the winding follows nvn_mtl.m's. Drawn the other way, every blit flipped the picture (NEO docked: upside down)
+ // and the winding had to be inverted. DM_VK_FLIPY=0 brings the old way back
+@@ -170,7 +173,7 @@ static void x_read(void) { const char *c = getenv("DM_VK_CB_DRAWS"); g_x_cbdraws
+     g_x_nosetc = (e = getenv("DM_VK_X_NOSETC")) && atoi(e); g_x_nodrvc = (e = getenv("DM_VK_X_NODRVC")) && atoi(e); g_x_landcut = (e = getenv("DM_VK_X_LANDCUT")) && atoi(e);
+     g_x_nodispbar = (e = getenv("DM_VK_X_NODISPBAR")) && atoi(e);
+     g_x_nokeep = (e = getenv("DM_VK_X_NOKEEP")) && atoi(e); g_x_nobc = (e = getenv("DM_VK_X_NOBC")) && atoi(e); g_x_noshc = (e = getenv("DM_VK_X_NOSHC")) && atoi(e); g_x_cutany = (e = getenv("DM_VK_X_CUTANY")) && atoi(e); g_x_nogs = (e = getenv("DM_VK_X_NOGS")) && atoi(e); g_spv_alt = (e = getenv("DM_VK_SPV_ALT")) && atoi(e); g_rd_touch = !((e = getenv("DM_VK_RD_TOUCH")) && !atoi(e));
+-    g_lrz_touch = (e = getenv("DM_VK_LRZ_TOUCH")) ? atoi(e) : 1; if (g_lrz_touch == 1) g_lrz_touch = LRZ_ALL;   /* 0 none, 1 all, else LRZ_* bits */ g_fdz = !((e = getenv("DM_VK_FDZ")) && !atoi(e)); g_xfb_on = !((e = getenv("DM_VK_XFB")) && !atoi(e));
++    g_lrz_touch = (e = getenv("DM_VK_LRZ_TOUCH")) ? atoi(e) : !vk_is_turnip(); if (g_lrz_touch == 1) g_lrz_touch = LRZ_ALL;   /* 0 none, 1 all, else LRZ_* bits */ g_fdz = (e = getenv("DM_VK_FDZ")) ? atoi(e) != 0 : !vk_is_turnip(); g_xfb_on = !((e = getenv("DM_VK_XFB")) && !atoi(e));
+     g_psplit = (e = getenv("DM_VK_PASS_SPLIT")) ? atoi(e) : 0; g_setsplit = (e = getenv("DM_VK_SETSPLIT")) && atoi(e); g_psplit_depth = (e = getenv("DM_VK_PASS_SPLIT_DEPTH")) && atoi(e);
+     g_x_rdkeep = (e = getenv("DM_VK_X_RDKEEP")) && atoi(e); g_vbound = !((e = getenv("DM_VK_VBOUND")) && !atoi(e)); g_x_logfs = (e = getenv("DM_VK_LOG_FS")) ? strtoull(e, NULL, 16) : 0; g_x_nflat = 0; if ((e = getenv("DM_VK_X_FLAT_VS"))) for (char *q = (char *)e; *q && g_x_nflat < 8; ) { char *nx; uint64_t v = strtoull(q, &nx, 16); if (nx == q) break; int m = 7; if (*nx == ':') m = (int)strtol(nx + 1, &nx, 10); g_x_flat_mode[g_x_nflat] = m; g_x_flat[g_x_nflat++] = v; q = *nx ? nx + 1 : nx; } g_samp_snap = !((e = getenv("DM_NVN_SAMP_SNAP")) && !atoi(e)); g_lin_back = !((e = getenv("DM_VK_LIN_BACK")) && !atoi(e)); g_async_pipe = !((e = getenv("DM_VK_ASYNC_PIPE")) && !atoi(e)); g_prof_on = (e = getenv("DM_VK_PROF_SLOW")) && atoi(e); { extern volatile int g_vk_samp_log, g_vk_samp_log_boot; static int first = 1;   // the first read sees the start-up value, which mtl_reg_samp (game threads, no setenv there) may have taken already: not armed twice
+       if ((e = getenv("DM_VK_SAMP_LOG")) && atoi(e) > 0) { if (!(first && atoi(e) == g_vk_samp_log_boot)) g_vk_samp_log = atoi(e); setenv("DM_VK_SAMP_LOG", "0", 1); } first = 0; } g_x_nosetmemo = (e = getenv("DM_VK_X_NOSETMEMO")) && atoi(e); g_x_setverify = (e = getenv("DM_VK_X_SETVERIFY")) && atoi(e);
+@@ -1773,11 +1776,12 @@ static int prepare_draw(int prim, int indexed) {
+     k.raster_discard = S.rast_discard; k.alt = (uint32_t)g_spv_alt; k.cull = g_no_cull ? 0 : S.poly.cull;
+     // counter-clockwise front faces in Vulkan's framebuffer: Vulkan's clip space has y down, Metal's up (nvn_mtl.m: CCW when (front == CCW) != lower left), and the
+     // lower-left origin mode flips the viewport again, so CCW when (front == CCW) == lower left. Taken as given, upper-left games (NEO) culled their ground and walls
+-    k.front = g_front_ovr == 0 || g_front_ovr == 1 ? (uint32_t)g_front_ovr : (((S.poly.front == NVN_FRONT_FACE_CCW) == (g_lower_left != 0)) != (g_flipy != 0)) ^ (g_front_ovr == 2);
++    // the lower-left term is the queue's raster origin (g_queue_ll), as nvn_mtl.m's winding upstream: the same as the device's unless the queue was made before a change
++    k.front = g_front_ovr == 0 || g_front_ovr == 1 ? (uint32_t)g_front_ovr : (((S.poly.front == NVN_FRONT_FACE_CCW) == (g_queue_ll != 0)) != (g_flipy != 0)) ^ (g_front_ovr == 2);
+     static int plog = -1; if (plog < 0) plog = getenv("DM_VK_PIPE_LOG") ? atoi(getenv("DM_VK_PIPE_LOG")) > 0 : 0;   // the polygon-state lines come with DM_VK_PIPE_LOG: unset costs one branch per draw
+-    if (plog) { static int n; if (n < 16) { static int seen[16]; int b = (S.poly.cull & 3) << 2 | (S.poly.front & 1) << 1 | (g_lower_left != 0); if (!seen[b]) { seen[b] = 1; n++;
+-        VKLOG("polygon state: cull %d, front %d, lower-left origin %d, flipy %d → Vulkan cull %u front %u (DM_VK_FRONT=%d, DM_VK_NOCULL=%d)",
+-              (int)S.poly.cull, (int)S.poly.front, g_lower_left != 0, g_flipy != 0, k.cull, k.front, g_front_ovr, g_no_cull); } } }
++    if (plog) { static int n; if (n < 16) { static int seen[16]; int b = (S.poly.cull & 3) << 2 | (S.poly.front & 1) << 1 | (g_queue_ll != 0); if (!seen[b]) { seen[b] = 1; n++;
++        VKLOG("polygon state: cull %d, front %d, lower-left origin %d (queue %d), flipy %d → Vulkan cull %u front %u (DM_VK_FRONT=%d, DM_VK_NOCULL=%d)",
++              (int)S.poly.cull, (int)S.poly.front, g_lower_left != 0, g_queue_ll != 0, g_flipy != 0, k.cull, k.front, g_front_ovr, g_no_cull); } } }
+     k.mode = S.poly.mode; k.depth_clamp = S.depth_clamp;
+     k.bias_en = (S.poly.offset_en & (S.poly.mode == 0 ? 1 : S.poly.mode == 1 ? 2 : 4)) != 0;
+     if (var == 2) k.bias_en = 0;
+diff --git a/nxnative/dm/android/gfx_vk_present.c b/nxnative/dm/android/gfx_vk_present.c
+index 241c612..1125c7c 100644
+--- a/nxnative/dm/android/gfx_vk_present.c
++++ b/nxnative/dm/android/gfx_vk_present.c
+@@ -70,6 +70,8 @@ __attribute__((weak)) void dm_overlay_knob(int stick, float *dx, float *dy) { (v
+ __attribute__((weak)) int64_t dm_overlay_pressed(int ctl, uint64_t bit) { (void)ctl; (void)bit; return 0; }
+ __attribute__((weak)) int dm_menu_state(void) { return -1; }
+ __attribute__((weak)) int dm_menu_audio_available(void) { return 0; }
++__attribute__((weak)) int dm_menu_rate_available(void) { return 0; }
++__attribute__((weak)) int dm_menu_res_available(void) { return 0; }
+ __attribute__((weak)) int dm_overlay_fps(void) { return 0; }   // front_android.c: the pause menu's Show FPS
+ __attribute__((weak)) int dm_save_note(char *out, int cap) { if (cap > 0) out[0] = 0; return OVX_IDLE; }   // front_android.c: the save manager's rows
+ __attribute__((weak)) int dm_save_rows(ov_srow rows[OVM_ROWS]) { (void)rows; return 0; }
+@@ -374,9 +376,11 @@ static void cv_button(const ov_canvas *cv, const float b[4], const char *l, int
+ }
+ // The pause menu (overlay_layout.h: the rows, the tabs, the slider's track), in the raster's panel rectangle. Its letters are as large as a row allows (0.30 of
+ // its height, about 2.7 mm on a 6.7" phone and 3.6 mm on the 8.8" tablet) and smaller only when the widest row would not fit beside its control
+-static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Export save", "Import save", "Face buttons", "Audio output", "Resume", ""};
++static const char *const OVM_LABELS[OVM_N] = {"Show gamepad", "Opacity", "Edit layout", "Rumble", "Show FPS", "Mode", "Export save", "Import save", "Face buttons", "Audio output", "Frame rate", "Resolution", "Resume", ""};
+ static const char *const OVM_BUTTONS[OVM_N] = {[OVM_EDIT] = "Edit", [OVM_EXPORT] = "Export", [OVM_IMPORT] = "Import", [OVM_AUDIO] = "Select"};   // the rows that are a button: its word
+ static const char *const OVM_MODES[2] = {"Handheld", "Docked"};
++static const char *const OVM_RESS[3] = {"Low", "Auto", "High"};   // the render scale's steps (front_android.c OVM_RES)
++static const char *const OVM_RATES[2] = {"30 fps", "60 fps"};   // the frame step's target (front_android.c OVM_RATE)
+ static const char *const OVM_PADS[2] = {"Position", "Label"};   // a controller's face buttons (front_android.c pad_labels)
+ static void ov_menu_panel(const ov_canvas *cv, int st) {
+     float p[4] = {0, 0, (float)cv->w, (float)cv->h}, r[4]; ov_menu_rowrect(p, 0, r);
+@@ -386,7 +390,7 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
+     for (; is > 1; is--) {   // the widest row: its label, a gap and its control
+         float need = 0;
+         for (int i = 0; i < OVM_RESUME; i++) {
+-            float lw = cv_text_w(OVM_LABELS[i], is), cw = i == OVM_MODE ? 2 * (cv_text_w(OVM_MODES[0], is) + sh) : i == OVM_PAD ? 2 * (cv_text_w(OVM_PADS[0], is) + sh) : OVM_BUTTONS[i] ? cv_text_w(OVM_BUTTONS[i], is) + 2 * sh : sw + gap + cv_text_w("OFF", is);
++            float lw = cv_text_w(OVM_LABELS[i], is), cw = i == OVM_MODE ? 2 * (cv_text_w(OVM_MODES[0], is) + sh) : i == OVM_PAD ? 2 * (cv_text_w(OVM_PADS[0], is) + sh) : i == OVM_RATE ? 2 * (cv_text_w(OVM_RATES[0], is) + sh) : i == OVM_RES ? 3 * (cv_text_w(OVM_RESS[1], is) + sh) : OVM_BUTTONS[i] ? cv_text_w(OVM_BUTTONS[i], is) + 2 * sh : sw + gap + cv_text_w("OFF", is);
+             need = fmaxf(need, i == OVM_OPACITY ? fmaxf(lw / 0.38f, cv_text_w("80%", is) / 0.14f) : lw + gap + cw + rh * 0.3f);
+         }
+         if (need <= rw && cv_text_w(OVM_TAB_NAMES[0], is) < rw / 2 - sh) break;
+@@ -420,12 +424,14 @@ static void ov_menu_panel(const ov_canvas *cv, int st) {
+             cv_text(cv, x1 - cv_text_w(v, vs), cy, v, vs, x == OVX_FAILED ? C_ACCENT : C_WHITE);
+         } else if (OVM_BUTTONS[it]) {   // a button
+             float bw = cv_text_w(OVM_BUTTONS[it], is) + 2 * sh, b[4] = {x1 - bw, cy - rh * 0.30f, bw, rh * 0.60f}; cv_button(cv, b, OVM_BUTTONS[it], 0, 0);
+-        } else if (it == OVM_MODE || it == OVM_PAD) {   // two segments, the current one filled: handheld (performance) | docked (resolution); by position | by label
+-            const char *const *seg = it == OVM_MODE ? OVM_MODES : OVM_PADS; int cur = it == OVM_MODE ? st >> 2 & 1 : st >> 28 & 1;
+-            float hh = rh * 0.46f, segw = fmaxf(cv_text_w(seg[0], is), cv_text_w(seg[1], is)) + sh, x0 = x1 - 2 * segw;
++        } else if (it == OVM_MODE || it == OVM_PAD || it == OVM_RATE || it == OVM_RES) {   // two segments, the current one filled: handheld (performance) | docked (resolution); by position | by label
++            const char *const *seg = it == OVM_MODE ? OVM_MODES : it == OVM_RATE ? OVM_RATES : it == OVM_RES ? OVM_RESS : OVM_PADS; int nseg = it == OVM_RES ? 3 : 2;
++            int cur = it == OVM_MODE ? st >> 2 & 1 : it == OVM_RATE ? st >> 29 & 1 : it == OVM_RES ? (st >> 19 & 1) | (st >> 30 & 1) << 1 : st >> 28 & 1;
++            float hh = rh * 0.46f, segw = fmaxf(cv_text_w(seg[0], is), cv_text_w(seg[1], is)); if (nseg == 3) segw = fmaxf(segw, cv_text_w(seg[2], is));
++            segw += sh; float x0 = x1 - nseg * segw;
+             cv_rrect(cv, x0, cy - hh / 2, x1, cy + hh / 2, hh / 2, C_OFF);
+             cv_rrect(cv, x0 + cur * segw, cy - hh / 2, x0 + (cur + 1) * segw, cy + hh / 2, hh / 2, C_ACCENT);
+-            for (int k = 0; k < 2; k++) cv_text(cv, x0 + k * segw + (segw - cv_text_w(seg[k], is)) / 2, cy, seg[k], is, k == cur ? C_WHITE : C_DIM);
++            for (int k = 0; k < nseg; k++) cv_text(cv, x0 + k * segw + (segw - cv_text_w(seg[k], is)) / 2, cy, seg[k], is, k == cur ? C_WHITE : C_DIM);
+         } else {   // a switch
+             int on = st >> (it == OVM_OVERLAY ? 0 : it == OVM_RUMBLE ? 1 : 3) & 1; float sx0 = x1 - sw;
+             cv_rrect(cv, sx0, cy - sh / 2, x1, cy + sh / 2, sh / 2, on ? C_ACCENT : C_OFF);
+diff --git a/nxnative/dm/android/overlay_layout.h b/nxnative/dm/android/overlay_layout.h
+index ba75dfc..674a941 100644
+--- a/nxnative/dm/android/overlay_layout.h
++++ b/nxnative/dm/android/overlay_layout.h
+@@ -153,18 +153,27 @@ void dm_overlay_theme_done(const ov_theme *t);   // the pixels are on the GPU: t
+ 
+ // ---- the pause menu: a panel in the middle of the window: a row of tabs, the open tab's rows, and Resume. Everything is placed in a panel rectangle p
+ // (x, y, width, height: the window's for touches, the raster's for drawing), so the touches and the drawing agree ----
+-enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_PAD, OVM_AUDIO, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
++enum { OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_PAD, OVM_AUDIO, OVM_RATE, OVM_RES, OVM_RESUME, OVM_TAB, OVM_N };   // OVM_TAB: the tabs' row;
+             // OVM_EDIT: the layout editor; OVM_MODE: handheld (performance) or docked (resolution); OVM_EXPORT, OVM_IMPORT: the save manager (saves_android.c);
+-            // OVM_PAD: a controller's face buttons by their position or by their label (front_android.c pad_labels)
++            // OVM_PAD: a controller's face buttons by their position or by their label (front_android.c pad_labels); OVM_RATE: the frame step's target, 30 or 60 fps,
++            // for a game whose rewriter stubs step by the host's target (front_android.c dm_menu_rate_available); OVM_RES: the render scale of a game with a
++            // render-scale stub, in three steps (front_android.c dm_menu_res_available)
+ #define OVM_TABS 2
+-#define OVM_PER_TAB 5
+-static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_PAD}, {OVM_FPS, OVM_MODE, OVM_EXPORT, OVM_IMPORT, OVM_AUDIO}};
++#define OVM_PER_TAB 6
++static const int OVM_TAB_ITEMS[OVM_TABS][OVM_PER_TAB] = {{OVM_OVERLAY, OVM_OPACITY, OVM_EDIT, OVM_RUMBLE, OVM_PAD, OVM_AUDIO}, {OVM_FPS, OVM_RATE, OVM_RES, OVM_MODE, OVM_EXPORT, OVM_IMPORT}};
+ static const char *const OVM_TAB_NAMES[OVM_TABS] = {"Gamepad", "Game"};
+ #define OVM_ROWS (OVM_PER_TAB + 2)   // the tabs, a tab's rows (as many for every tab: the panel keeps its size), Resume
+-int dm_menu_audio_available(void);
+-static inline int ov_menu_item(int tab, int row) {
+-    int item = row == 0 ? OVM_TAB : row == OVM_ROWS - 1 ? OVM_RESUME : row > 0 && row < OVM_ROWS - 1 ? OVM_TAB_ITEMS[tab & 1][row - 1] : -1;
+-    return item == OVM_AUDIO && !dm_menu_audio_available() ? -1 : item;
++int dm_menu_audio_available(void); int dm_menu_rate_available(void); int dm_menu_res_available(void);
++static inline int ov_menu_item(int tab, int row) {   // the rows a tab has follow each other: one the device or the game lacks (audio outputs, the frame rate) leaves no gap
++    if (row == 0) return OVM_TAB;
++    if (row == OVM_ROWS - 1) return OVM_RESUME;
++    if (row < 0 || row >= OVM_ROWS) return -1;
++    for (int k = 0, n = 0; k < OVM_PER_TAB; k++) {
++        int it = OVM_TAB_ITEMS[tab & 1][k];
++        if (it < 0 || (it == OVM_AUDIO && !dm_menu_audio_available()) || (it == OVM_RATE && !dm_menu_rate_available()) || (it == OVM_RES && !dm_menu_res_available())) continue;
++        if (++n == row) return it;
++    }
++    return -1;
+ }
+ #define OV_MENU_ROW 0.115f   // row height, of the window's height
+ #define OV_MENU_W 0.95f      // panel width, of the window's height
+@@ -173,7 +182,7 @@ static inline int ov_menu_item(int tab, int row) {
+ #define OV_OPACITY_MAX 80
+ // what the menu shows (-1 = closed): bit 0 the gamepad is on, bit 1 rumble is on, bit 2 docked, bit 3 the frame rate shown, bits 4..7 the highlighted row + 1
+ // (0 = none), bit 8 the open tab, bits 9..15 the opacity in percent, bits 20..23 the last export's outcome (OVX_*), bits 24..27 a count of exports (its name
+-// changes with each). Bit 16: the text entry's panel instead (its edit count below); bit 17: the layout editor (OVE_ST_* below); bit 18: the save picker (OVS_ST)
++// changes with each), bit 28 face buttons by label, bit 29 the frame step's target is 60 fps, bits 19 and 30 the Resolution row's step (0 to 2: bit 19 its low bit). Bit 16: the text entry's panel instead (its edit count below); bit 17: the layout editor (OVE_ST_* below); bit 18: the save picker (OVS_ST)
+ int dm_menu_state(void);
+ enum { OVX_IDLE, OVX_BUSY, OVX_DONE, OVX_NOSAVE, OVX_FAILED };   // Export save: the button; copying; the export's name; the game has not saved yet; failed
+ int dm_save_note(char *out, int cap);   // front_android.c: the outcome (OVX_*) and the last export's name, or why it failed
+diff --git a/nxnative/dm/gfx/nvn/hle_nvn.c b/nxnative/dm/gfx/nvn/hle_nvn.c
+index c9727d9..9b407ee 100644
+--- a/nxnative/dm/gfx/nvn/hle_nvn.c
++++ b/nxnative/dm/gfx/nvn/hle_nvn.c
+@@ -754,8 +754,12 @@ NVN(nvnQueueBuilderGetQueueMemorySize, size_t, const NVNqueueBuilder *b) {
+ }
+ NVN(nvnQueueBuilderSetQueueMemory, void, NVNqueueBuilder *b, void *m, size_t n) { QB(b)->mem = m; QB(b)->mem_sz = n; }
+ NVN(nvnQueueInitialize, NVNboolean, NVNqueue *q, const NVNqueueBuilder *b) {
+-    *(queue_t *)q = (queue_t){MAGIC('Q', 'U', 'E', 'U'), ((const queue_builder_t *)b)->dev, 0};
+-    OLOG("QueueInitialize %p", (void *)q); return 1;
++    NVNdevice *d = ((const queue_builder_t *)b)->dev;
++    // the raster origin is the device's now (queue_t.origin_ll): Xenoblade Chronicles 2 creates its queue before it switches the device to upper left, and its
++    // draws keep the lower-left winding (taken from the device's current origin, its indirect-lighting triangle was culled and the scene drawn almost black)
++    uint32_t ll = !d || ((const dev_t_ *)d)->origin == NVN_WINDOW_ORIGIN_MODE_LOWER_LEFT;
++    *(queue_t *)q = (queue_t){MAGIC('Q', 'U', 'E', 'U'), d, 0, ll};
++    OLOG("QueueInitialize %p (raster origin %s)", (void *)q, ll ? "lower left" : "upper left"); return 1;
+ }
+ NVN(nvnQueueFinalize, void, NVNqueue *q) { ((queue_t *)q)->magic = 0; }
+ NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *info) {
+@@ -1387,6 +1391,7 @@ static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h) {
+     pthread_mutex_lock(&g_sub_mu);
+     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
+     if (!nvn_async()) ((queue_t *)q)->submits++;
++    mtl_set_queue_origin_lower_left(((queue_t *)q)->origin_ll);   // under the submission lock: this queue's raster origin for the winding of its draws
+     mtl_sub_begin(); ft_del_drain();
+     nvn_ft_poll();
+     mtl_sub_index((const uint64_t *)h, n);
+diff --git a/nxnative/dm/gfx/nvn/nvn_mtl.h b/nxnative/dm/gfx/nvn/nvn_mtl.h
+index 040d10c..b2504a3 100644
+--- a/nxnative/dm/gfx/nvn/nvn_mtl.h
++++ b/nxnative/dm/gfx/nvn/nvn_mtl.h
+@@ -9,6 +9,7 @@ void mtl_init(void);
+ void mtl_vbuf_stats(uint64_t *resolve, uint64_t *reuse, uint64_t *set, uint64_t *skip);
+ void mtl_set_depth_zero(int on);          // NVN depth mode: 1 = near is 0 (D3D / Metal), 0 = near is -w (GL, NVN's default); picks the vertex shaders' entry point (see shader_load in nvn_mtl.m)
+ void mtl_set_origin_lower_left(int on);   // NVN window origin: 1 = lower left (GL, NVN's default), 0 = upper left (D3D / Metal); see nvn_mtl.m
++void mtl_set_queue_origin_lower_left(int on);   // the submitting queue's raster origin (queue_t.origin_ll), which the winding follows; the viewports follow the device's
+ void bf_want_note(const char *key);
+ 
+ // Memory pool: [mem, mem+size) is expanded outward to page boundaries to build a zero-copy buffer; look up the buffer and offset by GPU address (= CPU address)
+diff --git a/nxnative/dm/gfx/nvn/nvn_mtl.m b/nxnative/dm/gfx/nvn/nvn_mtl.m
+index e7f7efa..e5e9858 100644
+--- a/nxnative/dm/gfx/nvn/nvn_mtl.m
++++ b/nxnative/dm/gfx/nvn/nvn_mtl.m
+@@ -3311,6 +3311,7 @@ static MTLTextureType ttype(int target, int fallback) {
+ // convention itself (text rendered into textures for the title and the menus came out upside down, and a MIRROR_Y copy of the frame)
+ static _Atomic int g_origin_ll;
+ void mtl_set_origin_lower_left(int on) { if (atomic_exchange(&g_origin_ll, on) != on) MLOG("window origin: %s", on ? "lower left (GL: viewport flipped, winding reversed, present flipped)" : "upper left"); }
++void mtl_set_queue_origin_lower_left(int on) { (void)on; }   // the Metal winding still follows the device origin here (the Android backend, gfx_vk_exec.c, takes the queue's)
+ void mtl_set_tex_pool_n(int n) { g_tpool_n = n; }
+ static id<MTLTexture> tex_by_id(int tid) {   // Caller holds g_rmu
+     if (g_tpool_n && tid >= g_tpool_n) { if (!g_stat_tex_oob++) MLOG("texture ID %d outside the pool (capacity %d) treated as an empty slot: reads 0", tid, g_tpool_n); return nil; }
+diff --git a/nxnative/dm/gfx/nvn/nvn_obj.h b/nxnative/dm/gfx/nvn/nvn_obj.h
+index 938270e..027bcf6 100644
+--- a/nxnative/dm/gfx/nvn/nvn_obj.h
++++ b/nxnative/dm/gfx/nvn/nvn_obj.h
+@@ -15,7 +15,9 @@ typedef struct { uint32_t magic, flags, origin, depth_mode; void *dbg_cb, *dbg_d
+ 
+ typedef struct { NVNdevice *dev; uint32_t flags; uint64_t cmd_sz, comp_sz, ctl_sz, flush; void *mem; uint64_t mem_sz; } queue_builder_t;
+ FITS(queue_builder_t, NVNqueueBuilder);
+-typedef struct { uint32_t magic; NVNdevice *dev; uint64_t submits; } queue_t;                 FITS(queue_t, NVNqueue);
++// origin_ll: the device's window origin when the queue was initialized (1 = lower left). NVN puts SET_WINDOW_ORIGIN.FLIP_Y into a queue's initial GPU state, and
++// nvnDeviceSetWindowOriginMode does not rewrite it: the raster winding of the queue's draws follows this, the viewports the current device origin (upstream's queue_t.origin_ll)
++typedef struct { uint32_t magic; NVNdevice *dev; uint64_t submits; uint32_t origin_ll; } queue_t;   FITS(queue_t, NVNqueue);
+ 
+ typedef struct { NVNdevice *dev; void *mem; uint64_t size; uint32_t flags; } pool_builder_t;  FITS(pool_builder_t, NVNmemoryPoolBuilder);
+ // A virtual pool (flags 0x200) keeps its sparse state in vp (hle_nvn.c struct vpool, NULL for an aliased one); vmode: 0 not mapped yet, 1 aliased onto one physical pool, 2 sparse
+diff --git a/nxnative/dm/gfx/tools/shader_split.py b/nxnative/dm/gfx/tools/shader_split.py
+index becf87a..e089492 100644
+--- a/nxnative/dm/gfx/tools/shader_split.py
++++ b/nxnative/dm/gfx/tools/shader_split.py
+@@ -1050,7 +1050,10 @@ def slct_programs(s, xv4, xc, ctls, uc, label, strict):
+         for si, co, cl, to, tl in (struct.unpack_from('<5I', nv, eo + 20 * i) for i in range(en)):
+             if not cl: continue
+             code, ctl = xv4[xc + co:xc + co + cl], ctls[uc + to:uc + to + tl]
+-            st = 'cs' if code[:4] == CS_MAGIC else sph_stage(code) if code[:4] == GFX_MAGIC else 'cs' if LOOSE_MONO and si == 5 else None   # stage 5 is compute: Xenoblade Chronicles: Definitive Edition's has no code header (shd_lgt / shd_post.wishp)
++            # stage 5 is compute, and its code area may have no header (Xenoblade Chronicles: Definitive Edition's shd_lgt / shd_post.wishp, Xenoblade Chronicles 2's
++            # shd_effect.wishp): taken as compute when the control's thread group (+0x748) is filled, as upstream's glslc_stage
++            headerless_cs = si == 5 and code[:4] not in (CS_MAGIC, GFX_MAGIC) and len(ctl) >= 0x754 and all(struct.unpack_from('<3I', ctl, 0x748))
++            st = 'cs' if code[:4] == CS_MAGIC or headerless_cs else sph_stage(code) if code[:4] == GFX_MAGIC else 'cs' if LOOSE_MONO and si == 5 else None
+             why = 'no code area header' if not st else check(label, st, ctl, code)
+             if why and strict: red(f'{label} program {p} stage {si}: {why}')
+             if why: return None
+diff --git a/nxnative/dm/host/hle_audren.c b/nxnative/dm/host/hle_audren.c
+index 8278bb1..abcb964 100644
+--- a/nxnative/dm/host/hle_audren.c
++++ b/nxnative/dm/host/hle_audren.c
+@@ -67,7 +67,7 @@ static void ev_check(void) {
+ }
+ static void render_main(void *arg) {
+     (void)arg;
+-    void (*exec)(void *, void *) = gsym("_ZN2nn5audio29ExecuteAudioRendererRenderingENS0_19AudioRendererHandleE");
++    Result (*exec)(void *, void *) = gsym("_ZN2nn5audio29ExecuteAudioRendererRenderingENS0_19AudioRendererHandleE");
+     void *out = dm_pcmout_open(2);
+     static int16_t data[NBUF][FRAME_MAX * 2]; static gbuf bufs[NBUF]; gbuf *free_list[NBUF]; int nfree = NBUF;
+     for (int i = 0; i < NBUF; i++) { bufs[i] = (gbuf){data[i], sizeof data[i], 0}; free_list[i] = &bufs[i]; }
+@@ -91,7 +91,7 @@ static void render_main(void *arg) {
+             got = g_cq_n[h % CQ]; if (got) memcpy(b->ptr, g_cq[h % CQ], (size_t)got * 4);   // (copied before the slot is handed back)
+             atomic_store(&g_cq_head, h + 1); popped = 1;
+         } else {   // SDK: generate commands → CPU processing (output taken in the host takeover) → signal the game's renderer event
+-            ev_check(); g_frame_n = 0; exec(g_handle[0], g_handle[1]); got = g_frame_n; if (got) memcpy(b->ptr, g_frame, (size_t)got * 4);
++            ev_check(); g_frame_n = 0; Result xr = exec(g_handle[0], g_handle[1]); got = g_frame_n; { static int once; if (xr && !once++) LOG("[RED] audren: ExecuteAudioRendererRendering failed %#x: no frame rendered", xr); } if (got) memcpy(b->ptr, g_frame, (size_t)got * 4);
+         }
+         pthread_mutex_unlock(&g_order_mu);
+         if (popped) cq_popped();
+@@ -324,7 +324,7 @@ static Result render_once(uint8_t *sys, int16_t *dst, int *nout) {
+         process = gsym("_ZN2nn5audio3dsp20CommandListProcessor7ProcessEv");
+     }
+     int md = gen20 ? *(int32_t *)(sys + 0x4c) : mode(sys), dv = gen20 ? *(int32_t *)(sys + 0x48) : device(sys);
+-    if (md != 1 || dv != 1) return 0x40299;   // same as the original: manual rendering needs CPU + manual mode
++    if (md != 1 || dv != 1) { static int once; if (!once++) LOG("[RED] audren: the renderer is not in CPU + manual mode (execution mode %d, rendering device %d): nothing is rendered", md, dv); return 0x40299; }   // same as the original: manual rendering needs CPU + manual mode
+     pthread_mutex_lock(&g_render_mu);
+     uint64_t t0 = now_ns();
+     // Command generation must exclude the game thread's RequestUpdate (AudioRenderSystem::Update, which holds the mutex at mu_off): the original system thread (SendCommandToDsp) generates under the same lock. Processing (the CPU DSP) stays outside the lock, as in the original.
+@@ -343,8 +343,19 @@ static Result render_once(uint8_t *sys, int16_t *dst, int *nout) {
+     pthread_mutex_unlock(&g_render_mu);
+     return RES_OK;
+ }
++// The AudioRenderSystem inside AudioRendererImpl: at +0x60 in SDK 16, at +0x50 in SDK 3.5.0 (Xenoblade Chronicles 2: with +0x60 the mode and device read 0, every render
++// returned 0x40299, the renderer's event was never signaled, the game updated once and stayed silent). Read off the SDK's own function, whose first add is `add xN, x0, #off`
++static size_t impl_sys_off(void) {
++    static size_t off;
++    if (!off) {
++        const uint32_t *f = guest_sym("_ZN2nn5audio6server24AudioRendererManagerImpl17AudioRendererImpl29ExecuteAudioRendererRenderingEv"); off = 0x60;
++        for (int i = 0; f && i < 12; i++) if ((f[i] & 0xffc003e0u) == 0x91000000u) { off = (f[i] >> 10) & 0xfff; break; }   // add xd, x0, #imm12
++        LOG("audren: AudioRenderSystem at +%#zx inside AudioRendererImpl", off);
++    }
++    return off;
++}
+ HLE_FORCE("_ZN2nn5audio6server24AudioRendererManagerImpl17AudioRendererImpl29ExecuteAudioRendererRenderingEv", "render one frame manually: SDK generates commands + CPU processing, the host takes the DeviceSink output",
+-          Result, h_ar_ImplExec, uint8_t *impl) { return render_once(impl + 0x60, g_frame, &g_frame_n); }   // the AudioRenderSystem sits at +0x60 inside AudioRendererImpl
++          Result, h_ar_ImplExec, uint8_t *impl) { return render_once(impl + impl_sys_off(), g_frame, &g_frame_n); }
+ // SDK 20 (The Legend of Zelda: Breath of the Wild 1.9.0): the public ExecuteAudioRendererRendering (sdk+0x221e90) calls the AudioRendererImpl version through the vtable (sdk+0x22ca88, just x0 += 0x60 and a jump through the PLT to here),
+ // so the takeover above is never reached. The original generates commands here without the update lock; with the render thread on the original and the game thread's RequestUpdate rendering catch-up frames ("nothing rendered since the last update"),
+ // both sides wrote the same command buffer at once and CommandListProcessor::Process sometimes read a half-written command list and crashed (once at 60 s and once at 134 s in the shrine). Taken over here, so rendering goes through the host's locked render as well
+diff --git a/nxnative/dm/host/hle_movie.c b/nxnative/dm/host/hle_movie.c
+index 8b1f55f..a43d76c 100644
+--- a/nxnative/dm/host/hle_movie.c
++++ b/nxnative/dm/host/hle_movie.c
+@@ -554,6 +554,16 @@ HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11De
+ // SDK 4's constructor has no priority argument (Dark Souls Remastered, NintendoSDK_movie 4.5.0). Without this take-over the SDK built its own decoder and the host's Configure read it as a host one (a call through a null pointer)
+ HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11DecoderModeE", "movie decoder (SDK 4, no priority): host implementation", void, h_movie_Decoder4,
+           void **self, int type, int fmt, int mode) { h_movie_Decoder(self, type, fmt, mode, 0); }
++// An earlier SDK's constructor takes neither a mode nor a priority (Xenoblade Chronicles 2 2.1.0: movie::Decoder(DecoderType, DecoderOutputFormat), C1 and C2 both exported). Without
++// this take-over the SDK built its own decoder, the host's Configure read it as a host one and called through G.find_i32 before md_syms had run: the game closed when its first
++// prerendered movie began (after the fight with the Ardainian soldiers in chapter 1, a call through a null pointer in h_movie_Configure)
++// That SDK's video output format 3 is NV12 (4 in the later ones, where 3 became RGBA): the game's player gives the decoder 1,382,400-byte outputs for its 1280x720 VP9 movie
++// (width x height x 3 / 2) and reads them as NV12
++static int md_fmt_old(int fmt) { return fmt == 3 ? MD_FMT_NV12 : fmt; }
++HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatE", "movie decoder (earlier SDK, no mode or priority): host implementation", void, h_movie_Decoder2,
++          void **self, int type, int fmt) { h_movie_Decoder(self, type, md_fmt_old(fmt), 0, 0); }
++HLE_FORCE("_ZN5movie7DecoderC2ENS_11DecoderTypeENS_19DecoderOutputFormatE", "movie decoder (earlier SDK, base object constructor): host implementation", void, h_movie_Decoder2b,
++          void **self, int type, int fmt) { h_movie_Decoder(self, type, md_fmt_old(fmt), 0, 0); }
+ static void md_free(void **self) {
+     mdec_t *d = md_of(self); if (!d) return;
+     md_defer_drop(d);
+diff --git a/nxnative/dm/host/loader.c b/nxnative/dm/host/loader.c
+index 0697714..b54d8db 100644
+--- a/nxnative/dm/host/loader.c
++++ b/nxnative/dm/host/loader.c
+@@ -209,6 +209,7 @@ static void force_check(void) {
+ }
+ 
+ // Read the rewriter table header (segment boundaries, slot numbers); any row beyond the header means an old-format build output (code modified at load time), which is rejected
++static int g_render_scale_stub;   // a module's fixups table has RENDER_SCALE: its rewriter stubs read the state page's render scale (dm_render_scale_has)
+ static void read_layout(module_t *m, const char *dir) {
+     char path[1024]; snprintf(path, sizeof path, "%s/%s.fixups.tsv", dir, m->name);
+     FILE *f = fopen(path, "r");
+@@ -227,6 +228,7 @@ static void read_layout(module_t *m, const char *dir) {
+         else if (!strcmp(key, "RO_OFF")) m->ro_off = v;
+         else if (!strcmp(key, "DATA_OFF")) m->data_off = v;
+         else if (!strcmp(key, "FPS_STATE_OFF")) m->fps_state_off = v;
++        else if (!strcmp(key, "RENDER_SCALE")) g_render_scale_stub = v != 0;   // the build has a render-scale stub (patch_nso.py): the Android pause menu offers its Resolution row
+         else if (!strcmp(key, "BUILD_ID")) sscanf(line, "# %*s %32s", m->build_id);
+         else for (int k = 0; k < KEY_N; k++) {
+             size_t n = strlen(kn[k]);
+@@ -272,6 +274,15 @@ void dm_fps_state_apply(void) {
+     char cap[32]; snprintf(cap, sizeof cap, ", capped at %d fps", t);
+     LOG("%s: frame step %s%s (%s)", g_fps_mod, !t ? "as the game sets it" : "in whole vsyncs decided by the host", t ? cap : "", e ? "DM_FPS_TARGET" : "game profile fps_target");
+ }
++int dm_render_scale_has(void) { return dm_fps_state != NULL && g_render_scale_stub; }
++// The target while the game runs (the Android pause menu's Frame rate row, front_android.c): the stubs and the present pacing (hle_nvn.c fps_step_cap) read the page every frame
++int dm_fps_target_has(void) { return dm_fps_state != NULL; }
++int dm_fps_target_get(void) { if (!dm_fps_state) return 0; uint32_t b = __atomic_load_n((uint32_t *)dm_fps_state, __ATOMIC_RELAXED); float f; memcpy(&f, &b, sizeof f); return (int)f; }
++void dm_fps_target_set(int t) {
++    if (!dm_fps_state || (t != 0 && t != 30 && t != 60)) return;
++    float f = (float)t; uint32_t b; memcpy(&b, &f, sizeof b); __atomic_store_n((uint32_t *)dm_fps_state, b, __ATOMIC_RELAXED);
++    LOG("%s: frame step target %d fps from now on", g_fps_mod, t);
++}
+ static void install_key_page(module_t *m) {
+     if (m->key_page_off + m->key_page_size > m->size) die("%s: key page out of range", m->name);
+     uint64_t *page = (uint64_t *)(m->base + m->key_page_off);
+diff --git a/tests/test_overlay_layout.py b/tests/test_overlay_layout.py
+index 5f57bdf..fa8d5f8 100644
+--- a/tests/test_overlay_layout.py
++++ b/tests/test_overlay_layout.py
+@@ -19,8 +19,10 @@ class OverlayLayout(unittest.TestCase):
+         harness = r'''
+ #include <assert.h>
+ #include "overlay_layout.h"
+-static int custom_faces, custom_a, custom_x, hidden_ctl = -1, audio_available;
++static int custom_faces, custom_a, custom_x, hidden_ctl = -1, audio_available, rate_available;
+ int dm_menu_audio_available(void) { return audio_available; }
++int dm_menu_rate_available(void) { return rate_available; }
++int dm_menu_res_available(void) { return rate_available; }
+ float dm_overlay_scale(void) { return 1; }
+ int dm_overlay_off(int l, int c) { return l == 1 && c == hidden_ctl; }
+ int dm_overlay_custom(int layout, int ctl, float *x, float *y, float *s) {
+@@ -88,10 +90,12 @@ int main(void) {
+     assert(ov_drag_pos(1100, 600, 1013, 50) == 506.5f);
+     assert(ov_drag_pos(1100, 505, 1013, 50) == 508);
+ 
+-    assert(ov_menu_item(0, OVM_ROWS - 2) == OVM_PAD && ov_menu_item(1, OVM_ROWS - 2) == -1);
+-    assert(ov_menu_item(1, OVM_ROWS - 1) == OVM_RESUME);
++    assert(ov_menu_item(0, OVM_ROWS - 3) == OVM_PAD && ov_menu_item(0, OVM_ROWS - 2) == -1);   // no audio outputs: the row is left out
++    assert(ov_menu_item(1, 1) == OVM_FPS && ov_menu_item(1, 2) == OVM_MODE && ov_menu_item(1, 4) == OVM_IMPORT && ov_menu_item(1, 5) == -1 && ov_menu_item(1, OVM_ROWS - 1) == OVM_RESUME);
+     audio_available = 1;
+-    assert(ov_menu_item(1, OVM_ROWS - 2) == OVM_AUDIO);
++    assert(ov_menu_item(0, OVM_ROWS - 2) == OVM_AUDIO);
++    rate_available = 1;   // rows follow each other: the frame rate and resolution rows take their places
++    assert(ov_menu_item(1, 2) == OVM_RATE && ov_menu_item(1, 3) == OVM_RES && ov_menu_item(1, 4) == OVM_MODE && ov_menu_item(1, OVM_ROWS - 2) == OVM_IMPORT);
+     const float screens[][2] = {{915, 412}, {1216, 760}, {2400, 1080}, {1080, 2400}};
+     for (unsigned s = 0; s < sizeof screens / sizeof screens[0]; s++) {
+         float W = screens[s][0], H = screens[s][1], step = H / OVE_GRID_ROWS, p[4];
