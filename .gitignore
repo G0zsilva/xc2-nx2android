@@ -1,0 +1,15 @@
+# Game files, keys and drivers never go into the repository
+put-game-files-here/*
+!put-game-files-here/README.txt
+drivers/*
+!drivers/README.md
+# Everything setup.sh makes
+work/
+work_test.log
+*.nsp
+*.nsz
+*.xci
+*.xcz
+*.keys
+*.apk
+.DS_Store
